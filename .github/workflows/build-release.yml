@@ -1,0 +1,226 @@
+name: Build and Release
+
+on:
+  push:
+    branches:
+      - master
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NDK_VERSION: "27.2.12479018"
+
+jobs:
+  build:
+    name: Build APK
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake make pkg-config python3 gcc g++ perl
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Cache Android NDK
+        id: ndk-cache
+        uses: actions/cache@v4
+        with:
+          path: /usr/local/lib/android/sdk/ndk/${{ env.NDK_VERSION }}
+          key: ndk-${{ runner.os }}-${{ env.NDK_VERSION }}
+
+      - name: Install Android NDK
+        if: steps.ndk-cache.outputs.cache-hit != 'true'
+        run: sdkmanager --install "ndk;${{ env.NDK_VERSION }}"
+
+      - name: Accept Android SDK licenses
+        run: yes | sdkmanager --licenses || true
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: armv7-linux-androideabi,aarch64-linux-android,i686-linux-android,x86_64-linux-android
+
+      - name: Cache Rust toolchain
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.rustup/toolchains
+            ~/.rustup/update-hashes
+          key: rustup-${{ runner.os }}-stable
+
+      - name: Cache Cargo registry and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            app/src/main/rust/slipstream-rust/target
+          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-
+
+      - name: Cache OpenSSL builds for Android
+        id: openssl-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/openssl-android
+          key: openssl-android-3.0.14-ndk${{ env.NDK_VERSION }}-v2
+
+      - name: Build OpenSSL for Android targets
+        if: steps.openssl-cache.outputs.cache-hit != 'true'
+        env:
+          ANDROID_NDK_HOME: /usr/local/lib/android/sdk/ndk/${{ env.NDK_VERSION }}
+        run: |
+          set -euo pipefail
+          
+          OPENSSL_VERSION="3.0.14"
+          OPENSSL_DIR="${GITHUB_WORKSPACE}/openssl-android"
+          ANDROID_API=23
+          
+          # Download OpenSSL source
+          curl -L "https://www.openssl.org/source/openssl-${OPENSSL_VERSION}.tar.gz" -o openssl.tar.gz
+          tar xzf openssl.tar.gz
+          cd "openssl-${OPENSSL_VERSION}"
+          
+          TOOLCHAIN="${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64"
+          export PATH="${TOOLCHAIN}/bin:$PATH"
+          export ANDROID_NDK_ROOT="${ANDROID_NDK_HOME}"
+          
+          # Build for each Android ABI
+          # Format: ABI:OpenSSL-target:clang-triple
+          TARGETS=(
+            "arm64-v8a:android-arm64:aarch64-linux-android"
+            "armeabi-v7a:android-arm:armv7a-linux-androideabi"
+            "x86:android-x86:i686-linux-android"
+            "x86_64:android-x86_64:x86_64-linux-android"
+          )
+          
+          for entry in "${TARGETS[@]}"; do
+            IFS=':' read -r ABI TARGET TRIPLE <<< "$entry"
+            echo "=== Building OpenSSL for ${ABI} ==="
+            
+            INSTALL_DIR="${OPENSSL_DIR}/${ABI}"
+            
+            # Clean previous build
+            make clean 2>/dev/null || true
+            make distclean 2>/dev/null || true
+            
+            # Set compiler paths
+            CC_PATH="${TOOLCHAIN}/bin/${TRIPLE}${ANDROID_API}-clang"
+            
+            # Configure OpenSSL for Android - pass CC directly to Configure
+            ./Configure "${TARGET}" \
+              -D__ANDROID_API__=${ANDROID_API} \
+              --prefix="${INSTALL_DIR}" \
+              --openssldir="${INSTALL_DIR}/ssl" \
+              no-shared \
+              no-tests \
+              no-ui-console \
+              CC="${CC_PATH}" \
+              AR="${TOOLCHAIN}/bin/llvm-ar" \
+              RANLIB="${TOOLCHAIN}/bin/llvm-ranlib"
+            
+            # Build and install
+            make -j$(nproc)
+            make install_sw
+            
+            echo "OpenSSL for ${ABI} installed to ${INSTALL_DIR}"
+          done
+          
+          echo "=== OpenSSL build complete ==="
+          ls -la "${OPENSSL_DIR}"
+
+      - name: Create debug keystore for signing
+        run: |
+          mkdir -p ~/.android
+          if [ ! -f ~/.android/debug.keystore ]; then
+            keytool -genkey -v -keystore ~/.android/debug.keystore \
+              -storepass android -alias androiddebugkey -keypass android \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -dname "CN=Android Debug,O=Android,C=US"
+          fi
+
+      - name: Build release APK
+        env:
+          ANDROID_NDK_HOME: /usr/local/lib/android/sdk/ndk/${{ env.NDK_VERSION }}
+          OPENSSL_ANDROID_HOME: ${{ github.workspace }}/openssl-android
+          # Sequential builds for reliable cross-compilation
+          CARGO_BUILD_JOBS: "1"
+        run: ./gradlew --no-daemon assembleRelease
+
+      - name: Collect APKs
+        run: |
+          mkdir -p dist
+
+          # Derive release identifier:
+          # - tag builds: use the tag name (e.g. v0.0.1)
+          # - non-tag builds: use a short SHA (e.g. snapshot-a1b2c3d)
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            RELEASE_NAME="${GITHUB_REF_NAME}"
+          else
+            RELEASE_NAME="snapshot-${GITHUB_SHA:0:7}"
+          fi
+          # Sanitize just in case (branches like feature/foo)
+          RELEASE_NAME="${RELEASE_NAME//\//-}"
+
+          shopt -s nullglob
+          apks=(app/build/outputs/apk/**/*.apk)
+          if (( ${#apks[@]} == 0 )); then
+            echo "No APKs found under app/build/outputs/apk" >&2
+            exit 1
+          fi
+
+          for apk in "${apks[@]}"; do
+            base="$(basename "${apk}")"
+            target="universal"
+            if [[ "${base}" == *arm64-v8a* ]]; then target="arm64-v8a"; fi
+            if [[ "${base}" == *armeabi-v7a* ]]; then target="armeabi-v7a"; fi
+            if [[ "${base}" == *x86_64* ]]; then target="x86_64"; fi
+            if [[ "${base}" == *x86* && "${base}" != *x86_64* ]]; then target="x86"; fi
+            if [[ "${base}" == *universal* ]]; then target="universal"; fi
+
+            out="dist/slipstream-plugin-${target}-${RELEASE_NAME}.apk"
+            echo "Copying ${apk} -> ${out}"
+            cp -f "${apk}" "${out}"
+          done
+
+          ls -lah dist/
+
+      - name: Upload APK artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: apks
+          path: dist/*.apk
+          if-no-files-found: error
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.apk
+          generate_release_notes: true
