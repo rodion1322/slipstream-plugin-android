@@ -1,3 +1,4 @@
+import com.nishtahir.CargoBuildTask
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 import java.io.IOException
 
@@ -40,10 +41,27 @@ android {
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
+    signingConfigs {
+        create("release") {
+            // Use debug keystore for CI builds if no release keystore is configured
+            // For production, set up proper signing via environment variables or local.properties
+            val keystorePath = System.getenv("KEYSTORE_PATH") ?: "${System.getProperty("user.home")}/.android/debug.keystore"
+            val keystorePassword = System.getenv("KEYSTORE_PASSWORD") ?: "android"
+            val keyAlias = System.getenv("KEY_ALIAS") ?: "androiddebugkey"
+            val keyPassword = System.getenv("KEY_PASSWORD") ?: "android"
+            
+            storeFile = file(keystorePath)
+            storePassword = keystorePassword
+            this.keyAlias = keyAlias
+            this.keyPassword = keyPassword
+        }
+    }
+
     buildTypes {
         release {
             isShrinkResources = true
             isMinifyEnabled = true
+            signingConfig = signingConfigs.getByName("release")
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
         }
     }
@@ -69,10 +87,20 @@ cargo {
     libname = "slipstream"
     targets = listOf("arm", "arm64", "x86", "x86_64")
     profile = cargoProfile
+    
+    // Determine features based on whether pre-built OpenSSL is available
+    val opensslAndroidHome = System.getenv("OPENSSL_ANDROID_HOME")
+    val usePrebuiltOpenssl = !opensslAndroidHome.isNullOrEmpty() && file(opensslAndroidHome).exists()
+    val features = if (usePrebuiltOpenssl) {
+        "openssl-static,picoquic-minimal-build"
+    } else {
+        "openssl-vendored,picoquic-minimal-build"
+    }
+    
     extraCargoBuildArguments = listOf(
         "-p", "slipstream-client",
         "--bin", "slipstream-client",
-        "--features", "openssl-vendored,picoquic-minimal-build",
+        "--features", features,
     )
     exec = { spec, toolchain ->
         run {
@@ -112,6 +140,28 @@ cargo {
             )
             spec.environment("PICOQUIC_AUTO_BUILD", "1")
             spec.environment("BUILD_TYPE", if (cargoProfile == "release") "Release" else "Debug")
+            
+            // Set OpenSSL paths for pre-built Android OpenSSL (from CI or local build)
+            val opensslAndroidHomeEnv = System.getenv("OPENSSL_ANDROID_HOME")
+            if (!opensslAndroidHomeEnv.isNullOrEmpty()) {
+                val opensslDir = file("$opensslAndroidHomeEnv/$abi")
+                if (opensslDir.exists()) {
+                    // For picoquic CMake build
+                    spec.environment("OPENSSL_ROOT_DIR", opensslDir.absolutePath)
+                    spec.environment("OPENSSL_INCLUDE_DIR", "${opensslDir.absolutePath}/include")
+                    spec.environment("OPENSSL_CRYPTO_LIBRARY", "${opensslDir.absolutePath}/lib/libcrypto.a")
+                    spec.environment("OPENSSL_SSL_LIBRARY", "${opensslDir.absolutePath}/lib/libssl.a")
+                    spec.environment("OPENSSL_USE_STATIC_LIBS", "TRUE")
+                    // For openssl-sys crate
+                    spec.environment("OPENSSL_DIR", opensslDir.absolutePath)
+                    spec.environment("OPENSSL_LIB_DIR", "${opensslDir.absolutePath}/lib")
+                    spec.environment("OPENSSL_STATIC", "1")
+                    // Tell slipstream-ffi to use external OpenSSL instead of vendored
+                    spec.environment("OPENSSL_NO_VENDOR", "1")
+                    project.logger.lifecycle("Using pre-built OpenSSL from: $opensslDir")
+                }
+            }
+            
             val toolchainPrebuilt = android.ndkDirectory
                 .resolve("toolchains/llvm/prebuilt")
                 .listFiles()
@@ -125,13 +175,13 @@ cargo {
     }
 }
 
+tasks.withType<CargoBuildTask>().configureEach {
+    doNotTrackState("Cargo builds are externally cached; always run.")
+}
+
 tasks.whenTaskAdded {
     when (name) {
-        "mergeDebugJniLibFolders", "mergeReleaseJniLibFolders" -> {
-            dependsOn("cargoBuild")
-            // Track Rust JNI output without adding a second source set (avoids duplicate resources).
-            inputs.dir(layout.buildDirectory.dir("rustJniLibs/android"))
-        }
+        "mergeDebugJniLibFolders", "mergeReleaseJniLibFolders" -> dependsOn("cargoBuild")
     }
 }
 
